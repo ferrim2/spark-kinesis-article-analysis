@@ -1,0 +1,126 @@
+version: '3.8'
+services:
+  localstack:
+    image: localstack/localstack:3.8
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=kinesis,s3
+      - DEFAULT_REGION=us-east-1
+      - LS_LOG=WARN
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal s3 ls > /dev/null 2>&1 || exit 1"] # probably not needed but faced issues with localstack early on
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    deploy: # for local testing
+      resources:
+        limits:
+          cpus: '2'
+        reservations:
+          cpus: '1'
+
+  article-publisher:
+    build: ./populate-script
+    volumes:
+      - ./populate-script:/app
+    environment:
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=us-east-1
+      - S3_BUCKET_NAME=my-bucket
+      - KINESIS_STREAM_NAME=MyStream
+      - NUM_ITERATIONS=50
+      - DATASET_SIZE_MB=10 # Adjust DATASET_SIZE_MB as needed for scalability testing.
+    depends_on:
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy: # for local testing
+      resources:
+        limits:
+          cpus: '2'
+        reservations:
+          cpus: '1'
+
+  spark-master:
+    image: apache/spark:3.5.5
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    environment:
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_HOST=spark-master
+    volumes:
+      - ./app:/opt/spark/work-dir
+      - spark_checkpoints:/opt/spark/checkpoints
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077"]
+
+  spark-worker-1:
+    image: apache/spark:3.5.5
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    volumes:
+      - ./app:/opt/spark/work-dir
+      - spark_checkpoints:/opt/spark/checkpoints
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+
+  # spark-worker-2:
+  #   image: apache/spark:3.5.5
+  #   depends_on:
+  #     - spark-master
+  #   environment:
+  #     - SPARK_MASTER_URL=spark://spark-master:7077
+  #   volumes:
+  #     - ./app:/opt/spark/work-dir
+  #     - spark_checkpoints:/opt/spark/checkpoints # Mount the Docker volume
+  #   command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+
+  spark-app:
+    image: apache/spark:3.5.5
+    build: ./spark-app
+    depends_on:
+      article-publisher:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    volumes:
+      - ./app:/opt/spark/work-dir
+      - spark_checkpoints:/opt/spark/checkpoints
+    environment:
+      - IVY_HOME=/tmp/.ivy2
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=us-east-1
+      - S3_BUCKET_NAME=my-bucket
+      - KINESIS_STREAM_NAME=MyStream
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_CHECKPOINT_LOCATION=/opt/spark/checkpoints/kinesis_checkpoint
+      - S3_CHECKPOINT_LOCATION=/opt/spark/checkpoints/s3_checkpoint
+      - SPARK_APP_NAME=KinesisArticleProcessor
+    command: ["/opt/spark/bin/spark-submit",
+              "--conf", "spark.jars.ivy=/tmp/.ivy2",
+              "--packages", "com.qubole.spark:spark-sql-kinesis_2.12:1.2.0_spark-3.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.667",
+              "--master", "spark-master:7077",
+              "/opt/spark/work-dir/process_articles.py"]
+    deploy: # for local testing
+      resources:
+        limits:
+          cpus: '2'
+        reservations:
+          cpus: '1'
+
+volumes:
+  spark_checkpoints:
